@@ -13,12 +13,16 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/gortmplib/pkg/amf0"
 	"github.com/bluenviron/gortmplib/pkg/bytecounter"
 	"github.com/bluenviron/gortmplib/pkg/handshake"
+	"github.com/bluenviron/gortmplib/pkg/liberrors"
 	"github.com/bluenviron/gortmplib/pkg/message"
 )
 
@@ -180,7 +184,26 @@ type Client struct {
 	authState     int
 	authSalt      string
 	authChallenge string
+
+	// play-mode read pump (nil in publish mode or before Initialize)
+	readDone    chan struct{}
+	done        chan struct{}
+	messages    chan message.Message
+	pumpWake    chan struct{}
+	readErr     error
+	cmdMu       sync.Mutex
+	cmdPending  map[int]chan *message.CommandAMF0
+	nextCmdID   int
+	pauseMu     sync.Mutex
+	paused      bool
+	pausePoint  time.Duration
+	lastMediaTS atomic.Int64
+	closed      bool
 }
+
+// clientMessageQueueSize is the size of the queue holding messages decoded by
+// the internal read pump and waiting to be returned by Read().
+const clientMessageQueueSize = 256
 
 // Initialize initializes Client.
 func (c *Client) Initialize(ctx context.Context) error {
@@ -513,6 +536,8 @@ func (c *Client) initialize3() error {
 		if res.Name != "onStatus" || !resultIsOK1(res) {
 			return fmt.Errorf("bad result: %v", res)
 		}
+
+		c.startReadPump()
 	} else {
 		err = c.mrw.Write(&message.CommandAMF0{
 			ChunkStreamID: 3,
@@ -591,7 +616,23 @@ func (c *Client) initialize3() error {
 
 // Close closes the connection.
 func (c *Client) Close() {
+	c.pauseMu.Lock()
+	if c.closed {
+		c.pauseMu.Unlock()
+		return
+	}
+	c.closed = true
+	c.pauseMu.Unlock()
+
+	if c.done != nil {
+		close(c.done)
+	}
+
 	c.nconn.Close()
+
+	if c.readDone != nil {
+		<-c.readDone
+	}
 }
 
 // NetConn returns the underlying net.Conn.
@@ -610,11 +651,335 @@ func (c *Client) BytesSent() uint64 {
 }
 
 // Read reads a message.
+// In play mode, messages are delivered through an internal read pump:
+// while the client is paused no media message is delivered, and after
+// resuming only messages with non-decreasing timestamps are forwarded.
+// It is safe to call Read from multiple goroutines; each message is
+// delivered to exactly one caller.
 func (c *Client) Read() (message.Message, error) {
-	return c.mrw.Read()
+	if c.messages == nil {
+		return c.mrw.Read()
+	}
+
+	for {
+		msg, ok := <-c.messages
+		if !ok {
+			return nil, c.readErr
+		}
+
+		// messages may have been queued before a pause took effect.
+		// Drop media while paused, still advancing the timestamp so that
+		// post-resume ordering stays correct.
+		if ts, isMedia := mediaMessageDTS(msg); isMedia {
+			c.pauseMu.Lock()
+			paused := c.paused
+			c.pauseMu.Unlock()
+
+			if paused {
+				c.advanceMediaTS(ts)
+				continue
+			}
+		}
+
+		return msg, nil
+	}
 }
 
 // Write writes a message.
 func (c *Client) Write(msg message.Message) error {
 	return c.mrw.Write(msg)
+}
+
+// Paused returns whether the client is currently paused.
+func (c *Client) Paused() bool {
+	c.pauseMu.Lock()
+	defer c.pauseMu.Unlock()
+	return c.paused
+}
+
+// Pause sends a NetStream "pause" command ("pause" flag set to true) to the
+// server and waits for the corresponding onStatus. The pause position is the
+// timestamp of the last delivered media message. It can only be used in play
+// mode.
+func (c *Client) Pause(ctx context.Context) error {
+	return c.sendPause(ctx, true)
+}
+
+// Resume sends a NetStream "pause" command ("pause" flag set to false) to the
+// server, resuming playback from the point at which Pause() was called, and
+// waits for the corresponding onStatus. It can only be used in play mode.
+func (c *Client) Resume(ctx context.Context) error {
+	return c.sendPause(ctx, false)
+}
+
+func (c *Client) sendPause(ctx context.Context, pause bool) error {
+	if c.messages == nil {
+		return liberrors.ErrClientNotPlaying{}
+	}
+
+	c.pauseMu.Lock()
+	if c.closed {
+		c.pauseMu.Unlock()
+		return liberrors.ErrClientClosed{}
+	}
+
+	if pause && c.paused {
+		c.pauseMu.Unlock()
+		return liberrors.ErrClientAlreadyPaused{}
+	}
+
+	if !pause && !c.paused {
+		c.pauseMu.Unlock()
+		return liberrors.ErrClientNotPaused{}
+	}
+
+	position := time.Duration(c.lastMediaTS.Load())
+	if pause {
+		c.pausePoint = position
+	} else {
+		position = c.pausePoint
+	}
+	c.paused = pause
+	c.pauseMu.Unlock()
+
+	err := c.sendPauseAndWait(ctx, pause, position)
+	if err != nil {
+		// roll back the local state, since the server did not acknowledge it
+		c.pauseMu.Lock()
+		c.paused = !pause
+		c.pauseMu.Unlock()
+		return err
+	}
+
+	// wake the pump so that a media delivery blocked before the pause
+	// command can be re-evaluated against the new state.
+	select {
+	case c.pumpWake <- struct{}{}:
+	default:
+	}
+
+	return nil
+}
+
+func (c *Client) sendPauseAndWait(ctx context.Context, pause bool, position time.Duration) error {
+	c.cmdMu.Lock()
+	c.nextCmdID++
+	commandID := c.nextCmdID
+	resCh := make(chan *message.CommandAMF0, 1)
+	c.cmdPending[commandID] = resCh
+	c.cmdMu.Unlock()
+
+	defer func() {
+		c.cmdMu.Lock()
+		delete(c.cmdPending, commandID)
+		c.cmdMu.Unlock()
+	}()
+
+	err := c.mrw.Write(&message.CommandAMF0{
+		ChunkStreamID:   4,
+		MessageStreamID: 0x1000000,
+		Name:            "pause",
+		CommandID:       commandID,
+		Arguments: []any{
+			nil,
+			pause,
+			float64(position / time.Millisecond),
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	select {
+	case res := <-resCh:
+		if res.Name == "onStatus" && resultIsOK1(res) {
+			return nil
+		}
+
+		return fmt.Errorf("server rejected %s: %v", pauseCommandName(pause), res)
+
+	case <-ctx.Done():
+		return ctx.Err()
+
+	case <-c.readDone:
+		return liberrors.ErrClientClosed{}
+	}
+}
+
+func pauseCommandName(pause bool) string {
+	if pause {
+		return "pause"
+	}
+	return "unpause"
+}
+
+func (c *Client) startReadPump() {
+	c.messages = make(chan message.Message, clientMessageQueueSize)
+	c.pumpWake = make(chan struct{}, 1)
+	c.readDone = make(chan struct{})
+	c.done = make(chan struct{})
+	c.cmdPending = make(map[int]chan *message.CommandAMF0)
+	c.nextCmdID = 5
+
+	go c.readPump()
+}
+
+func (c *Client) readPump() {
+	defer close(c.readDone)
+
+	for {
+		msg, err := c.mrw.Read()
+		if err != nil {
+			c.failReadPump(err)
+			return
+		}
+
+		if cmd, ok := msg.(*message.CommandAMF0); ok {
+			c.pumpHandleCommand(cmd)
+			continue
+		}
+
+		if !c.pumpAcceptMessage(msg) {
+			continue
+		}
+
+		if !c.pumpDeliver(msg) {
+			return
+		}
+	}
+}
+
+func (c *Client) failReadPump(err error) {
+	c.readErr = err
+
+	c.cmdMu.Lock()
+	c.cmdPending = nil
+	c.cmdMu.Unlock()
+
+	close(c.messages)
+}
+
+func (c *Client) pumpHandleCommand(cmd *message.CommandAMF0) {
+	c.cmdMu.Lock()
+	ch, ok := c.cmdPending[cmd.CommandID]
+
+	// some servers (e.g. nginx-rtmp) answer with an onStatus carrying
+	// command ID 0 instead of the request command ID; route it to the
+	// only pending waiter.
+	if !ok && cmd.Name == "onStatus" && len(c.cmdPending) == 1 {
+		for _, pending := range c.cmdPending {
+			ch = pending
+			ok = true
+		}
+	}
+	c.cmdMu.Unlock()
+
+	if ok {
+		select {
+		case ch <- cmd:
+		case <-c.done:
+		}
+		return
+	}
+
+	// unsolicited commands are delivered to the user like in the
+	// non-pump path.
+	c.pumpDeliver(cmd) //nolint:errcheck
+}
+
+// pumpAcceptMessage reports whether msg must be delivered to the user.
+// Media messages are dropped while paused and when their timestamp is older
+// than the last delivered one (the server restarts from a keyframe on resume).
+func (c *Client) pumpAcceptMessage(msg message.Message) bool {
+	ts, isMedia := mediaMessageDTS(msg)
+	if !isMedia {
+		return true
+	}
+
+	c.pauseMu.Lock()
+	paused := c.paused
+	c.pauseMu.Unlock()
+
+	if paused {
+		return false
+	}
+
+	return c.advanceMediaTS(ts)
+}
+
+// advanceMediaTS records ts as the latest observed media timestamp when it is
+// not older than the current one. It returns false when the message must be
+// dropped as out of order.
+func (c *Client) advanceMediaTS(ts time.Duration) bool {
+	for {
+		cur := c.lastMediaTS.Load()
+
+		if ts < time.Duration(cur) {
+			return false
+		}
+
+		if c.lastMediaTS.CompareAndSwap(cur, int64(ts)) {
+			return true
+		}
+	}
+}
+
+// pumpDeliver sends msg to the user queue. When the queue is full it waits,
+// but keeps honoring pause state changes and connection termination so that
+// Pause() cannot be blocked by a stalled reader.
+func (c *Client) pumpDeliver(msg message.Message) bool {
+	_, isMedia := mediaMessageDTS(msg)
+
+	for {
+		c.pauseMu.Lock()
+		paused := c.paused
+		c.pauseMu.Unlock()
+
+		if paused && isMedia {
+			return true
+		}
+
+		select {
+		case c.messages <- msg:
+			return true
+
+		default:
+		}
+
+		select {
+		case c.messages <- msg:
+			return true
+
+		case <-c.pumpWake:
+			continue
+
+		case <-c.done:
+			return false
+		}
+	}
+}
+
+// mediaMessageDTS returns the DTS of a media (audio or video) message.
+func mediaMessageDTS(msg message.Message) (time.Duration, bool) {
+	switch msg := msg.(type) {
+	case *message.Video:
+		return msg.DTS, true
+
+	case *message.VideoExCodedFrames:
+		return msg.DTS, true
+
+	case *message.VideoExFramesX:
+		return msg.DTS, true
+
+	case *message.Audio:
+		if msg.Codec == 0 {
+			return 0, false
+		}
+		return msg.DTS, true
+
+	case *message.AudioExCodedFrames:
+		return msg.DTS, true
+	}
+
+	return 0, false
 }
