@@ -18,6 +18,7 @@ Features:
 - Support most Enhanced RTMP features
 - Support TLS encryption (RTMPS)
 - Support Diffie-hellman based encryption (RTMPE)
+- Support automatic reconnection of publishers, with codec configuration retransmission and key frame recovery
 - Support encoding and decoding data with the AMF0 format
 
 ## Table of contents
