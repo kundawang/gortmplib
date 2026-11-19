@@ -14,6 +14,7 @@ import (
 
 	"github.com/bluenviron/gortmplib/pkg/amf0"
 	"github.com/bluenviron/gortmplib/pkg/codecs"
+	"github.com/bluenviron/gortmplib/pkg/liberrors"
 	"github.com/bluenviron/gortmplib/pkg/message"
 )
 
@@ -219,6 +220,38 @@ func (w *Writer) Initialize() error {
 func (w *Writer) Wait() error {
 	<-w.readerDone
 	return w.readerErr
+}
+
+// SetChunkSize changes the chunk size used to send messages and notifies the
+// peer with a SetChunkSize control message.
+//
+// The connection must implement ChunkSizeUpdater; otherwise,
+// liberrors.ErrChunkSizeUnsupported is returned. It can be called while the
+// connection is established, also concurrently with the Write methods: the
+// control message is written with the previous chunk size and the new size is
+// applied to the messages that follow it, so that message boundaries, track
+// IDs, timestamps and payloads are preserved.
+//
+// Setting the size that is already in use is a no-op and returns nil.
+// It returns liberrors.ErrChunkSizeInvalid if v is zero or greater than
+// rawmessage.MaxChunkSize, or the write error if the control message cannot be
+// sent. In all error cases the chunk size is left unchanged.
+func (w *Writer) SetChunkSize(v uint32) error {
+	u, ok := w.Conn.(ChunkSizeUpdater)
+	if !ok {
+		return liberrors.ErrChunkSizeUnsupported{}
+	}
+
+	return u.SetChunkSize(v)
+}
+
+// ChunkSize returns the chunk size used to send messages.
+func (w *Writer) ChunkSize() uint32 {
+	if u, ok := w.Conn.(ChunkSizeUpdater); ok {
+		return u.ChunkSize()
+	}
+
+	return 0
 }
 
 func (w *Writer) writeTracks() error {

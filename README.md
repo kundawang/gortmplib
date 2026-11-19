@@ -16,6 +16,7 @@ Features:
 - Play and publish multiple video and audio tracks
 - Play and publish tracks encoded with AV1, VP9, H265, H264, Opus, FLAC, MPEG-4 Audio (AAC), MPEG-1/2 Audio (MP3), AC-3, G711 (PCMA, PCMU), LPCM
 - Support most Enhanced RTMP features
+- Change the chunk size of an established connection at runtime
 - Support TLS encryption (RTMPS)
 - Support Diffie-hellman based encryption (RTMPE)
 - Support encoding and decoding data with the AMF0 format

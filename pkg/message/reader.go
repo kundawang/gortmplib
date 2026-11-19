@@ -5,6 +5,7 @@ import (
 	"io"
 
 	"github.com/bluenviron/gortmplib/pkg/bytecounter"
+	"github.com/bluenviron/gortmplib/pkg/liberrors"
 	"github.com/bluenviron/gortmplib/pkg/rawmessage"
 )
 
@@ -195,7 +196,9 @@ func (r *Reader) Read() (Message, error) {
 	case *SetChunkSize:
 		err = r.rmr.SetChunkSize(tmsg.Value)
 		if err != nil {
-			return nil, err
+			// the peer announced an invalid size: the stream cannot be
+			// parsed any further with the current size.
+			return nil, liberrors.ErrChunkSizePeerInvalid{Value: tmsg.Value}
 		}
 
 	case *AbortMessage:
@@ -206,4 +209,10 @@ func (r *Reader) Read() (Message, error) {
 	}
 
 	return msg, nil
+}
+
+// ChunkSize returns the chunk size currently used to parse messages, as
+// announced by the peer's last valid SetChunkSize message.
+func (r *Reader) ChunkSize() uint32 {
+	return r.rmr.ChunkSize()
 }

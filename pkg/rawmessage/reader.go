@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/bluenviron/gortmplib/pkg/bytecounter"
@@ -76,7 +77,7 @@ func (rc *readerChunkStream) readMessage(typ byte) (*Message, error) {
 			return nil, fmt.Errorf("received type 0 chunk but expected type 3 chunk")
 		}
 
-		err := rc.readChunk(&rc.mr.c0, rc.mr.chunkSize, false)
+		err := rc.readChunk(&rc.mr.c0, rc.mr.chunkSize.Load(), false)
 		if err != nil {
 			return nil, err
 		}
@@ -116,7 +117,7 @@ func (rc *readerChunkStream) readMessage(typ byte) (*Message, error) {
 			return nil, fmt.Errorf("received type 1 chunk but expected type 3 chunk")
 		}
 
-		err := rc.readChunk(&rc.mr.c1, rc.mr.chunkSize, false)
+		err := rc.readChunk(&rc.mr.c1, rc.mr.chunkSize.Load(), false)
 		if err != nil {
 			return nil, err
 		}
@@ -154,7 +155,7 @@ func (rc *readerChunkStream) readMessage(typ byte) (*Message, error) {
 			return nil, fmt.Errorf("received type 2 chunk but expected type 3 chunk")
 		}
 
-		chunkBodyLen := min(rc.curBodyLen, rc.mr.chunkSize)
+		chunkBodyLen := min(rc.curBodyLen, rc.mr.chunkSize.Load())
 
 		err := rc.readChunk(&rc.mr.c2, chunkBodyLen, false)
 		if err != nil {
@@ -181,7 +182,7 @@ func (rc *readerChunkStream) readMessage(typ byte) (*Message, error) {
 
 	default: // 3
 		if rc.curBodyRecv != 0 {
-			chunkBodyLen := min(rc.curBodyLen-rc.curBodyRecv, rc.mr.chunkSize)
+			chunkBodyLen := min(rc.curBodyLen-rc.curBodyRecv, rc.mr.chunkSize.Load())
 
 			err := rc.readChunk(&rc.mr.c3, chunkBodyLen, rc.hasExtendedTimestamp)
 			if err != nil {
@@ -208,7 +209,7 @@ func (rc *readerChunkStream) readMessage(typ byte) (*Message, error) {
 			return nil, fmt.Errorf("received type 3 chunk without previous chunk")
 		}
 
-		chunkBodyLen := min(rc.curBodyLen, rc.mr.chunkSize)
+		chunkBodyLen := min(rc.curBodyLen, rc.mr.chunkSize.Load())
 
 		err := rc.readChunk(&rc.mr.c3, chunkBodyLen, rc.hasExtendedTimestamp)
 		if err != nil {
@@ -241,7 +242,7 @@ type Reader struct {
 	LastAckCount uint32
 
 	bufr          *bufio.Reader
-	chunkSize     uint32
+	chunkSize     atomic.Uint32
 	ackWindowSize uint32
 	msg           Message
 	c0            chunk.Chunk0
@@ -254,7 +255,7 @@ type Reader struct {
 // Initialize initializes the Reader.
 func (r *Reader) Initialize() {
 	r.bufr = bufio.NewReader(r.BR)
-	r.chunkSize = 128
+	r.chunkSize.Store(128)
 	r.chunkStreams = make(map[byte]*readerChunkStream)
 }
 
@@ -275,14 +276,23 @@ func NewReader(
 	return r
 }
 
-// SetChunkSize sets the maximum chunk size.
+// SetChunkSize sets the maximum chunk size used to parse messages.
+// It returns an error if v is zero or greater than MaxChunkSize; in that case,
+// the reader is left unchanged. Read() applies the value announced by the peer
+// through SetChunkSize control messages.
 func (r *Reader) SetChunkSize(v uint32) error {
-	if v > maxBodySize {
-		return fmt.Errorf("chunk size (%d) exceeds maximum (%d)", v, maxBodySize)
+	if err := ValidateChunkSize(v); err != nil {
+		return err
 	}
 
-	r.chunkSize = v
+	r.chunkSize.Store(v)
 	return nil
+}
+
+// ChunkSize returns the current maximum chunk size.
+// It is safe to call it while Read() is running.
+func (r *Reader) ChunkSize() uint32 {
+	return r.chunkSize.Load()
 }
 
 // SetWindowAckSize sets the window acknowledgement size.

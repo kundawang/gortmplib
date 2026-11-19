@@ -69,3 +69,25 @@ func (rw *ReadWriter) Read() (Message, error) {
 func (rw *ReadWriter) Write(msg Message) error {
 	return rw.w.Write(msg)
 }
+
+// SetChunkSize changes the chunk size used to write messages and notifies the
+// peer with a SetChunkSize control message.
+//
+// The change is atomic with respect to concurrent Write calls: messages
+// already in progress are completed with the previous size, while messages
+// written after this call use the new size.
+func (rw *ReadWriter) SetChunkSize(value uint32) error {
+	return rw.w.SetChunkSize(value)
+}
+
+// ChunkSize returns the chunk size currently used to write messages.
+func (rw *ReadWriter) ChunkSize() uint32 {
+	return rw.w.ChunkSize()
+}
+
+// PeerChunkSize returns the chunk size currently used by the peer to send
+// messages. It is updated whenever a valid SetChunkSize control message is
+// received.
+func (rw *ReadWriter) PeerChunkSize() uint32 {
+	return rw.r.ChunkSize()
+}

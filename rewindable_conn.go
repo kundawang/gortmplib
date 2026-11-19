@@ -3,6 +3,7 @@ package gortmplib
 import (
 	"errors"
 
+	"github.com/bluenviron/gortmplib/pkg/liberrors"
 	"github.com/bluenviron/gortmplib/pkg/message"
 )
 
@@ -20,6 +21,33 @@ type rewindableConn struct {
 func (r *rewindableConn) BytesReceived() uint64           { return r.Conn.BytesReceived() }
 func (r *rewindableConn) BytesSent() uint64               { return r.Conn.BytesSent() }
 func (r *rewindableConn) Write(msg message.Message) error { return r.Conn.Write(msg) }
+
+// SetChunkSize forwards the call to the underlying connection, if supported.
+func (r *rewindableConn) SetChunkSize(v uint32) error {
+	if u, ok := r.Conn.(ChunkSizeUpdater); ok {
+		return u.SetChunkSize(v)
+	}
+
+	return liberrors.ErrChunkSizeUnsupported{}
+}
+
+// ChunkSize forwards the call to the underlying connection, if supported.
+func (r *rewindableConn) ChunkSize() uint32 {
+	if u, ok := r.Conn.(ChunkSizeUpdater); ok {
+		return u.ChunkSize()
+	}
+
+	return 0
+}
+
+// PeerChunkSize forwards the call to the underlying connection, if supported.
+func (r *rewindableConn) PeerChunkSize() uint32 {
+	if u, ok := r.Conn.(ChunkSizeUpdater); ok {
+		return u.PeerChunkSize()
+	}
+
+	return 0
+}
 
 func (r *rewindableConn) Read() (message.Message, error) {
 	if !r.rewinded {

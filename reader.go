@@ -915,6 +915,18 @@ func (r *Reader) OnDataLPCM(track *Track, cb OnDataLPCMFunc) {
 	}
 }
 
+// PeerChunkSize returns the chunk size used by the peer to send messages, as
+// announced by the last valid SetChunkSize control message.
+//
+// The connection must implement ChunkSizeUpdater; otherwise, 0 is returned.
+func (r *Reader) PeerChunkSize() uint32 {
+	if u, ok := r.Conn.(ChunkSizeUpdater); ok {
+		return u.PeerChunkSize()
+	}
+
+	return 0
+}
+
 // Read reads data.
 func (r *Reader) Read() error {
 	msg, err := r.Conn.Read()

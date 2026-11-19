@@ -195,11 +195,26 @@ func NewWriter(
 }
 
 // SetChunkSize sets the maximum chunk size.
-func (w *Writer) SetChunkSize(v uint32) {
+// It returns an error if v is not a valid chunk size (zero or greater than
+// MaxChunkSize).
+func (w *Writer) SetChunkSize(v uint32) error {
+	if err := ValidateChunkSize(v); err != nil {
+		return err
+	}
+
 	w.mutex.Lock()
 	defer w.mutex.Unlock()
 
 	w.chunkSize = v
+	return nil
+}
+
+// ChunkSize returns the current maximum chunk size.
+func (w *Writer) ChunkSize() uint32 {
+	w.mutex.Lock()
+	defer w.mutex.Unlock()
+
+	return w.chunkSize
 }
 
 // SetWindowAckSize sets the window acknowledgement size.

@@ -13,12 +13,14 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/gortmplib/pkg/amf0"
 	"github.com/bluenviron/gortmplib/pkg/bytecounter"
 	"github.com/bluenviron/gortmplib/pkg/handshake"
+	"github.com/bluenviron/gortmplib/pkg/liberrors"
 	"github.com/bluenviron/gortmplib/pkg/message"
 )
 
@@ -180,6 +182,10 @@ type Client struct {
 	authState     int
 	authSalt      string
 	authChallenge string
+
+	mutex sync.Mutex
+	// true once Close() has been called.
+	closed bool
 }
 
 // Initialize initializes Client.
@@ -200,6 +206,7 @@ func (c *Client) Initialize(ctx context.Context) error {
 			c.authState++
 			continue
 		}
+
 		return err
 	}
 }
@@ -288,7 +295,13 @@ func (c *Client) initialize3() error {
 		return err
 	}
 
-	c.mrw = message.NewReadWriter(c.bc, c.bc, false)
+	mrw := message.NewReadWriter(c.bc, c.bc, false)
+
+	// publish the read-writer before writing anything, so that SetChunkSize
+	// becomes available as soon as the connection is usable.
+	c.mutex.Lock()
+	c.mrw = mrw
+	c.mutex.Unlock()
 
 	err = c.mrw.Write(&message.SetWindowAckSize{
 		Value: 2500000,
@@ -591,7 +604,18 @@ func (c *Client) initialize3() error {
 
 // Close closes the connection.
 func (c *Client) Close() {
-	c.nconn.Close()
+	c.mutex.Lock()
+	if c.closed {
+		c.mutex.Unlock()
+		return
+	}
+	c.closed = true
+	nconn := c.nconn
+	c.mutex.Unlock()
+
+	if nconn != nil {
+		nconn.Close()
+	}
 }
 
 // NetConn returns the underlying net.Conn.
@@ -609,12 +633,82 @@ func (c *Client) BytesSent() uint64 {
 	return c.bc.Writer.Count()
 }
 
+// readWriter returns the message read-writer, or nil if the client has not
+// been initialized yet.
+func (c *Client) readWriter() *message.ReadWriter {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	return c.mrw
+}
+
 // Read reads a message.
 func (c *Client) Read() (message.Message, error) {
-	return c.mrw.Read()
+	mrw := c.readWriter()
+	if mrw == nil {
+		return nil, liberrors.ErrClientNotInitialized{}
+	}
+
+	return mrw.Read()
 }
 
 // Write writes a message.
 func (c *Client) Write(msg message.Message) error {
-	return c.mrw.Write(msg)
+	mrw := c.readWriter()
+	if mrw == nil {
+		return liberrors.ErrClientNotInitialized{}
+	}
+
+	return mrw.Write(msg)
+}
+
+// SetChunkSize changes the chunk size used to send messages and notifies the
+// peer with a SetChunkSize control message.
+//
+// It can be called while the connection is established, also concurrently
+// with Write and with the Writer methods: the control message is written with
+// the previous chunk size and the new size is applied to the messages that
+// follow it, so that message boundaries are never broken.
+//
+// It returns liberrors.ErrClientNotInitialized if the client has not been
+// initialized, liberrors.ErrClientClosed if the connection has been closed,
+// liberrors.ErrChunkSizeInvalid if v is zero or greater than
+// rawmessage.MaxChunkSize, or the write error if the control message cannot be
+// sent. In all error cases the chunk size is left unchanged.
+// Setting the size that is already in use is a no-op and returns nil.
+func (c *Client) SetChunkSize(v uint32) error {
+	c.mutex.Lock()
+	switch {
+	case c.closed:
+		c.mutex.Unlock()
+		return liberrors.ErrClientClosed{}
+	case c.mrw == nil:
+		c.mutex.Unlock()
+		return liberrors.ErrClientNotInitialized{}
+	}
+	mrw := c.mrw
+	c.mutex.Unlock()
+
+	return mrw.SetChunkSize(v)
+}
+
+// ChunkSize returns the chunk size used to send messages.
+func (c *Client) ChunkSize() uint32 {
+	mrw := c.readWriter()
+	if mrw == nil {
+		return 0
+	}
+
+	return mrw.ChunkSize()
+}
+
+// PeerChunkSize returns the chunk size used by the peer to send messages, as
+// announced by the last received SetChunkSize message.
+func (c *Client) PeerChunkSize() uint32 {
+	mrw := c.readWriter()
+	if mrw == nil {
+		return 0
+	}
+
+	return mrw.PeerChunkSize()
 }

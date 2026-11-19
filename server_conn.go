@@ -11,6 +11,7 @@ import (
 	"github.com/bluenviron/gortmplib/pkg/amf0"
 	"github.com/bluenviron/gortmplib/pkg/bytecounter"
 	"github.com/bluenviron/gortmplib/pkg/handshake"
+	"github.com/bluenviron/gortmplib/pkg/liberrors"
 	"github.com/bluenviron/gortmplib/pkg/message"
 	"github.com/bluenviron/gortmplib/pkg/rc4rw"
 )
@@ -608,4 +609,44 @@ func (c *ServerConn) Read() (message.Message, error) {
 // Write writes a message.
 func (c *ServerConn) Write(msg message.Message) error {
 	return c.mrw.Write(msg)
+}
+
+// SetChunkSize changes the chunk size used to send messages and notifies the
+// peer with a SetChunkSize control message.
+//
+// It can be called while the connection is established, also concurrently
+// with Write: the control message is written with the previous chunk size and
+// the new size is applied to the messages that follow it, so that message
+// boundaries are never broken.
+//
+// It returns liberrors.ErrServerConnNotInitialized if the connection has not
+// been initialized, liberrors.ErrChunkSizeInvalid if v is zero or greater than
+// rawmessage.MaxChunkSize, or the write error if the control message cannot be
+// sent. In all error cases the chunk size is left unchanged.
+// Setting the size that is already in use is a no-op and returns nil.
+func (c *ServerConn) SetChunkSize(v uint32) error {
+	if c.mrw == nil {
+		return liberrors.ErrServerConnNotInitialized{}
+	}
+
+	return c.mrw.SetChunkSize(v)
+}
+
+// ChunkSize returns the chunk size used to send messages.
+func (c *ServerConn) ChunkSize() uint32 {
+	if c.mrw == nil {
+		return 0
+	}
+
+	return c.mrw.ChunkSize()
+}
+
+// PeerChunkSize returns the chunk size used by the peer to send messages, as
+// announced by the last received SetChunkSize message.
+func (c *ServerConn) PeerChunkSize() uint32 {
+	if c.mrw == nil {
+		return 0
+	}
+
+	return c.mrw.PeerChunkSize()
 }

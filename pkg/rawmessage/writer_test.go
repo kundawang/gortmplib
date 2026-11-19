@@ -92,7 +92,7 @@ func TestWriterAcknowledge(t *testing.T) {
 				w.AckValue = 4294967096
 			}
 
-			w.SetChunkSize(65536)
+			require.NoError(t, w.SetChunkSize(65536))
 			w.SetWindowAckSize(100)
 
 			err := w.Write(&rawmessage.Message{
@@ -153,7 +153,7 @@ func TestWriterConcurrent(t *testing.T) {
 		<-start
 
 		for range writers * messagesPerWriter {
-			w.SetChunkSize(128)
+			require.NoError(t, w.SetChunkSize(128))
 			w.SetWindowAckSize(1 << 30)
 			w.SetAcknowledgeValue(0)
 		}
@@ -202,7 +202,7 @@ func BenchmarkWriter(b *testing.B) {
 		BCW: bc,
 	}
 	w.Initialize()
-	w.SetChunkSize(4096)
+	w.SetChunkSize(4096) //nolint:errcheck
 
 	msg := &rawmessage.Message{
 		ChunkStreamID:   6,
