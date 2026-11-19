@@ -13,12 +13,14 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/bluenviron/gortmplib/pkg/amf0"
 	"github.com/bluenviron/gortmplib/pkg/bytecounter"
 	"github.com/bluenviron/gortmplib/pkg/handshake"
+	"github.com/bluenviron/gortmplib/pkg/liberrors"
 	"github.com/bluenviron/gortmplib/pkg/message"
 )
 
@@ -591,7 +593,34 @@ func (c *Client) initialize3() error {
 
 // Close closes the connection.
 func (c *Client) Close() {
+	if c.mrw != nil {
+		// unblock a ping in progress before closing the connection, so that
+		// its result is reported as ErrPingClosed.
+		c.mrw.InterruptPing()
+	}
+
 	c.nconn.Close()
+}
+
+// Ping sends a ping request to the server and waits for the corresponding
+// response, returning the measured round-trip time.
+//
+// It can be called while media messages are being read: the response is
+// matched with the request through the Server Time field and does not
+// interfere with Read. It can also be called when Read is not being called,
+// in which case incoming messages are buffered and returned by subsequent
+// Read calls.
+//
+// When ctx expires, Ping returns ErrPingTimeout if the deadline was exceeded
+// or the context error if the context was canceled. It returns
+// ErrPingTooFrequent if another ping is already in progress, ErrPingClosed if
+// the connection is closed, and ErrPingNotConnected if it is not initialized.
+func (c *Client) Ping(ctx context.Context) (time.Duration, error) {
+	if c.mrw == nil {
+		return 0, liberrors.ErrPingNotConnected
+	}
+
+	return c.mrw.Ping(ctx)
 }
 
 // NetConn returns the underlying net.Conn.
